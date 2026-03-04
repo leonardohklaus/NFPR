@@ -1,0 +1,21 @@
+# Configuração OpenSSL para permitir assinatura RSA-SHA1
+# Exigido pela SEFAZ-RS na NF-e 4.0 (OpenSSL 3.x bloqueia SHA1 por padrão)
+
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+alg_section = evp_properties
+
+[provider_sect]
+default = default_sect
+legacy = legacy_sect
+
+[default_sect]
+activate = 1
+
+[legacy_sect]
+activate = 1
+
+[evp_properties]
+rh_allow_sha1_signatures = yes
