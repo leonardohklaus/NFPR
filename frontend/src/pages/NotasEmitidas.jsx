@@ -1,15 +1,16 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   ClipboardList, Download, Printer, RefreshCw,
-  Search, CheckCircle2, XCircle, Clock, AlertCircle, Loader2, Users,
+  Search, CheckCircle2, XCircle, Clock, AlertCircle, Loader2, Users, Ban,
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
-import { listarNotas, detalheNota, baixarXmlNota, listarProdutores } from '../services/api'
+import { listarNotas, detalheNota, baixarXmlNota, listarProdutores, cancelarNota } from '../services/api'
 import { encodeId } from '../utils/urlUtils'
 import { abrirDanfe } from '../utils/danfe'
 import { useProdutorAtivo } from '../context/ProdutorContext'
 import Combobox from '../components/Combobox'
+import Modal from '../components/Modal'
 import { mascararDocumento } from '../utils/documentos'
 
 const STATUS_CONFIG = {
@@ -43,6 +44,9 @@ export default function NotasEmitidas() {
   const [baixando, setBaixando] = useState(null)  // id da nota sendo baixada
   const [imprimindo, setImprimindo] = useState(null)
   const [produtores, setProdutores] = useState([])
+  const [modalCancelar, setModalCancelar] = useState(null)  // nota a cancelar
+  const [justificativa, setJustificativa] = useState('')
+  const [cancelando, setCancelando] = useState(false)
   const navigate = useNavigate()
   const { produtorAtivo, selecionarProdutor, carregando: carregandoProdutor } = useProdutorAtivo()
 
@@ -100,7 +104,7 @@ export default function NotasEmitidas() {
       a.download = filename
       a.click()
       URL.revokeObjectURL(url)
-      toast.success('XML baixado com sucesso')
+      toast.success(nota.status === 'cancelada' ? 'XML de cancelamento baixado' : 'XML baixado com sucesso')
     } catch {
       toast.error('Erro ao baixar o XML')
     } finally {
@@ -108,11 +112,31 @@ export default function NotasEmitidas() {
     }
   }
 
+  const handleCancelar = async () => {
+    if (!modalCancelar) return
+    if (justificativa.trim().length < 15) {
+      toast.error('Justificativa deve ter ao menos 15 caracteres')
+      return
+    }
+    setCancelando(true)
+    try {
+      await cancelarNota(modalCancelar.id, justificativa.trim())
+      toast.success('Nota cancelada com sucesso')
+      setModalCancelar(null)
+      setJustificativa('')
+      await carregar(produtorAtivo?.id)
+    } catch (err) {
+      const msg = err?.response?.data?.detail || 'Erro ao cancelar a nota'
+      toast.error(msg)
+    } finally {
+      setCancelando(false)
+    }
+  }
+
   const handleDanfe = async (nota) => {
     setImprimindo(nota.id)
     try {
       const detalhe = await detalheNota(nota.id)
-      // Monta os objetos esperados por abrirDanfe
       const dados = {
         numero:               detalhe.numero,
         serie:                detalhe.serie,
@@ -127,12 +151,25 @@ export default function NotasEmitidas() {
         itens:                detalhe.itens,
         informacoes_adicionais: detalhe.informacoes_adicionais,
       }
-      const resultado = detalhe.status === 'autorizada' ? {
-        sucesso:          true,
-        chave_acesso:     detalhe.chave_acesso,
-        numero_protocolo: detalhe.numero_protocolo,
-        data_autorizacao: detalhe.data_autorizacao,
-      } : null
+      let resultado = null
+      if (detalhe.status === 'autorizada') {
+        resultado = {
+          sucesso:          true,
+          chave_acesso:     detalhe.chave_acesso,
+          numero_protocolo: detalhe.numero_protocolo,
+          data_autorizacao: detalhe.data_autorizacao,
+        }
+      } else if (detalhe.status === 'cancelada') {
+        resultado = {
+          sucesso:                 true,
+          cancelada:               true,
+          chave_acesso:            detalhe.chave_acesso,
+          numero_protocolo:        detalhe.numero_protocolo,
+          data_autorizacao:        detalhe.data_autorizacao,
+          protocolo_cancelamento:  detalhe.protocolo_cancelamento,
+          data_cancelamento:       detalhe.data_cancelamento,
+        }
+      }
       abrirDanfe(dados, resultado)
     } catch {
       toast.error('Erro ao carregar dados para o DANFE')
@@ -303,8 +340,8 @@ export default function NotasEmitidas() {
                         {/* Download XML */}
                         <button
                           onClick={() => handleBaixarXml(nota)}
-                          disabled={baixando === nota.id || nota.status !== 'autorizada'}
-                          title={nota.status !== 'autorizada' ? 'XML disponível apenas para notas autorizadas' : 'Baixar XML'}
+                          disabled={baixando === nota.id || !['autorizada', 'cancelada'].includes(nota.status)}
+                          title={!['autorizada', 'cancelada'].includes(nota.status) ? 'XML disponível apenas para notas autorizadas ou canceladas' : nota.status === 'cancelada' ? 'Baixar XML de cancelamento' : 'Baixar XML'}
                           className="p-1.5 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed
                                      text-gray-500 hover:text-verde-700 hover:bg-verde-50 enabled:cursor-pointer"
                         >
@@ -324,6 +361,17 @@ export default function NotasEmitidas() {
                             ? <Loader2 className="w-4 h-4 animate-spin" />
                             : <Printer className="w-4 h-4" />}
                         </button>
+                        {/* Cancelar */}
+                        {nota.status === 'autorizada' && (
+                          <button
+                            onClick={() => { setModalCancelar(nota); setJustificativa('') }}
+                            title="Cancelar NF-e"
+                            className="p-1.5 rounded-lg transition-colors cursor-pointer
+                                       text-gray-500 hover:text-red-700 hover:bg-red-50"
+                          >
+                            <Ban className="w-4 h-4" />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -333,6 +381,52 @@ export default function NotasEmitidas() {
           </div>
         )}
       </div>
+
+      {/* Modal de cancelamento */}
+      {modalCancelar && (
+        <Modal
+          title={`Cancelar NF-e Nº ${String(modalCancelar.numero).padStart(6, '0')}`}
+          onClose={() => { setModalCancelar(null); setJustificativa('') }}
+        >
+          <div className="space-y-4">
+            <p className="text-sm text-gray-600">
+              Esta ação irá enviar o evento de cancelamento à SEFAZ-RS. O cancelamento é
+              irreversível e só é permitido dentro do prazo legal.
+            </p>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Justificativa <span className="text-gray-400 font-normal">(mín. 15 caracteres)</span>
+              </label>
+              <textarea
+                value={justificativa}
+                onChange={(e) => setJustificativa(e.target.value)}
+                rows={3}
+                placeholder="Informe o motivo do cancelamento..."
+                className="input-field w-full resize-none"
+              />
+              <p className="text-xs text-gray-400 mt-1">{justificativa.length} caracteres</p>
+            </div>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => { setModalCancelar(null); setJustificativa('') }}
+                className="btn-secondary"
+                disabled={cancelando}
+              >
+                Voltar
+              </button>
+              <button
+                onClick={handleCancelar}
+                disabled={cancelando || justificativa.trim().length < 15}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-xl text-sm font-medium
+                           hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {cancelando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Ban className="w-4 h-4" />}
+                {cancelando ? 'Cancelando...' : 'Confirmar Cancelamento'}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }

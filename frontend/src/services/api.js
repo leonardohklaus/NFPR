@@ -137,6 +137,11 @@ export const baixarXmlNota = async (id) => {
   return { blob: response.data, filename }
 }
 
+export const cancelarNota = async (id, justificativa) => {
+  const { data } = await api.post(`/notas/${id}/cancelar`, { justificativa })
+  return data
+}
+
 // ========== SEFAZ ==========
 export const statusSefaz = async (ambiente = 2, produtorId = null) => {
   const query = produtorId

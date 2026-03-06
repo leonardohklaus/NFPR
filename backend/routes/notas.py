@@ -5,7 +5,7 @@ from sqlalchemy import select, func, delete
 from typing import Optional
 from schemas.nfpr import NotaFiscalSchema, NFeAutorizacaoResponse
 from services.xml_service import gerar_xml_nfe
-from services.sefaz_service import transmitir_nfe, _assinar_xml
+from services.sefaz_service import transmitir_nfe, _assinar_xml, cancelar_nfe
 from services.certificado_service import carregar_de_produtor
 from database import get_db
 from models.nota_fiscal import NotaFiscal, ItemNF, RespostaSefaz
@@ -329,22 +329,99 @@ async def listar_respostas_sefaz(
     ]
 
 
+class CancelarNotaRequest(BaseModel):
+    justificativa: str
+
+
+@router.post("/{nota_id}/cancelar")
+async def cancelar_nota(
+    nota_id: int,
+    body: CancelarNotaRequest,
+    db: AsyncSession = Depends(get_db),
+    _: Usuario = Depends(get_current_user),
+):
+    """Cancela uma NF-e autorizada junto à SEFAZ-RS"""
+    result = await db.execute(select(NotaFiscal).where(NotaFiscal.id == nota_id))
+    nota = result.scalar_one_or_none()
+    if not nota:
+        raise HTTPException(status_code=404, detail="Nota não encontrada")
+    if nota.status != "autorizada":
+        raise HTTPException(status_code=422, detail="Apenas notas autorizadas podem ser canceladas")
+    if not nota.chave_acesso or not nota.numero_protocolo:
+        raise HTTPException(status_code=422, detail="Nota sem chave de acesso ou protocolo de autorização")
+
+    # Carregar certificado do produtor vinculado
+    if nota.produtor_id:
+        prod_result = await db.execute(select(Produtor).where(Produtor.id == nota.produtor_id))
+        produtor = prod_result.scalar_one_or_none()
+        if produtor:
+            info_cert = carregar_de_produtor(produtor)
+            if not info_cert["sucesso"]:
+                raise HTTPException(status_code=422, detail=f"Certificado inválido: {info_cert['mensagem']}")
+
+    resultado = cancelar_nfe(
+        chave_acesso=nota.chave_acesso,
+        numero_protocolo=nota.numero_protocolo,
+        cnpj_cpf=nota.produtor_documento,
+        justificativa=body.justificativa,
+        ambiente=nota.ambiente,
+    )
+
+    # Registrar retorno SEFAZ independentemente do resultado
+    db.add(RespostaSefaz(
+        nota_id=nota_id,
+        tipo="cancelamento",
+        codigo_status=resultado.get("codigo_status"),
+        mensagem=resultado.get("mensagem"),
+        xml_enviado=resultado.get("xml_enviado"),
+        xml_recebido=resultado.get("xml_recebido"),
+    ))
+
+    if resultado.get("sucesso"):
+        nota.status = "cancelada"
+        nota.xml_cancelamento = resultado.get("xml_cancelamento")
+        nota.protocolo_cancelamento = resultado.get("protocolo_cancelamento")
+        nota.data_cancelamento = resultado.get("data_cancelamento")
+
+    await db.commit()
+
+    if not resultado.get("sucesso"):
+        raise HTTPException(
+            status_code=422,
+            detail=resultado.get("mensagem", "Cancelamento rejeitado pela SEFAZ"),
+        )
+
+    return {
+        "sucesso": True,
+        "mensagem": resultado.get("mensagem"),
+        "protocolo_cancelamento": resultado.get("protocolo_cancelamento"),
+        "data_cancelamento": resultado.get("data_cancelamento"),
+    }
+
+
 @router.get("/{nota_id}/xml", response_class=Response)
 async def baixar_xml(
     nota_id: int,
     db: AsyncSession = Depends(get_db),
     _: Usuario = Depends(get_current_user),
 ):
-    """Baixa o XML autorizado da nota"""
+    """Baixa o XML da nota — cancelamento (se cancelada) ou autorização"""
     result = await db.execute(select(NotaFiscal).where(NotaFiscal.id == nota_id))
     nota = result.scalar_one_or_none()
     if not nota:
         raise HTTPException(status_code=404, detail="Nota não encontrada")
-    if not nota.xml_autorizado:
+
+    if nota.status == "cancelada" and nota.xml_cancelamento:
+        xml_content = nota.xml_cancelamento
+        filename = f"canc_{nota.numero:06d}_{nota.chave_acesso or 'sem-chave'}.xml"
+    elif nota.xml_autorizado:
+        xml_content = nota.xml_autorizado
+        filename = f"nfe_{nota.numero:06d}_{nota.chave_acesso or 'sem-chave'}.xml"
+    else:
         raise HTTPException(status_code=404, detail="XML não disponível para esta nota")
-    filename = f"nfe_{nota.numero:06d}_{nota.chave_acesso or 'sem-chave'}.xml"
+
     return Response(
-        content=nota.xml_autorizado,
+        content=xml_content,
         media_type="application/xml",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
@@ -436,4 +513,6 @@ async def detalhe_nota(
         "valor_total": nota.valor_total,
         "valor_icms": nota.valor_icms,
         "valor_funrural": nota.valor_funrural,
+        "protocolo_cancelamento": nota.protocolo_cancelamento,
+        "data_cancelamento": nota.data_cancelamento,
     }

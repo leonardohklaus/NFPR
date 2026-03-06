@@ -43,7 +43,8 @@ const FRETES = {
 // ─── Gerador principal ───────────────────────────────────────────────────────
 
 function gerarHtml({ dados, resultado }) {
-  const isRascunho    = !resultado?.sucesso;
+  const isRascunho    = !resultado?.sucesso && !resultado?.cancelada;
+  const isCancelada   = resultado?.cancelada === true;
   const isHomologacao = parseInt(dados.ambiente) === 2;
 
   const p    = dados.produtor     || {};
@@ -81,7 +82,9 @@ function gerarHtml({ dados, resultado }) {
   const enderecoDest = `${de.logradouro || ''}${de.numero ? ', ' + de.numero : ''}${de.complemento ? ' — ' + de.complemento : ''}`;
 
   // ── Watermark ──────────────────────────────────────────────────────────────
-  const watermarkHtml = isRascunho
+  const watermarkHtml = isCancelada
+    ? `<div class="wm wm-cancelada">CANCELADA</div>`
+    : isRascunho
     ? `<div class="wm">SEM VALOR FISCAL</div>`
     : '';
 
@@ -179,6 +182,9 @@ function gerarHtml({ dados, resultado }) {
       color:rgba(0,0,0,0.08); white-space:nowrap;
       pointer-events:none; z-index:1;
       font-family:Arial,sans-serif;
+    }
+    .wm-cancelada {
+      color:rgba(200,0,0,0.13);
     }
   `;
 
@@ -543,6 +549,9 @@ ${homolBanner}
       </div>
       ${totalPesoKg > 0 ? `<div style="margin-top:4px;padding-top:4px;border-top:1px dashed #000;">
         <strong>Peso Total dos Itens:</strong> ${fmt3(totalPesoKg)} kg${totalPesoKg >= 1000 ? ` &nbsp;(${fmt3(totalPesoKg / 1000)} t)` : ''}
+      </div>` : ''}
+      ${isCancelada ? `<div style="margin-top:5px;font-weight:bold;font-size:6.5pt;color:#c00000;">
+        ✕ NOTA FISCAL CANCELADA — PROTOCOLO: ${resultado?.protocolo_cancelamento || ''} — DATA: ${resultado?.data_cancelamento || ''}
       </div>` : ''}
       ${isRascunho ? `<div style="margin-top:5px;font-weight:bold;font-size:6.5pt;">
         ⚠ DOCUMENTO SEM VALOR FISCAL — NOTA NÃO TRANSMITIDA À SEFAZ

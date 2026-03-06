@@ -52,6 +52,9 @@ class NotaFiscal(Base):
     informacoes_adicionais: Mapped[str | None] = mapped_column(String(2000))
     xml_autorizado: Mapped[str | None] = mapped_column(String)
     data_autorizacao: Mapped[str | None] = mapped_column(String(25))
+    xml_cancelamento: Mapped[str | None] = mapped_column(Text)
+    protocolo_cancelamento: Mapped[str | None] = mapped_column(String(20))
+    data_cancelamento: Mapped[str | None] = mapped_column(String(25))
     criado_em: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # FK para produtor cadastrado (opcional — mantém compatibilidade com notas antigas)

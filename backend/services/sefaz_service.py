@@ -23,6 +23,7 @@ URLS_SEFAZ = {
         "NfeConsultaProtocolo": "https://nfe-homologacao.sefazrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
         "NfeStatusServico": "https://nfe-homologacao.sefazrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
         "NFeInutilizacao": "https://nfe-homologacao.sefazrs.rs.gov.br/ws/NFeInutilizacao/NFeInutilizacao4.asmx",
+        "NFeRecepcaoEvento": "https://nfe-homologacao.sefazrs.rs.gov.br/ws/recepcaoevento/recepcaoevento4.asmx",
     },
     "producao": {
         "NfeAutorizacao": "https://nfe.sefazrs.rs.gov.br/ws/NfeAutorizacao/NFeAutorizacao4.asmx",
@@ -30,6 +31,7 @@ URLS_SEFAZ = {
         "NfeConsultaProtocolo": "https://nfe.sefazrs.rs.gov.br/ws/NfeConsulta/NfeConsulta4.asmx",
         "NfeStatusServico": "https://nfe.sefazrs.rs.gov.br/ws/NfeStatusServico/NfeStatusServico4.asmx",
         "NFeInutilizacao": "https://nfe.sefazrs.rs.gov.br/ws/NFeInutilizacao/NFeInutilizacao4.asmx",
+        "NFeRecepcaoEvento": "https://nfe.sefazrs.rs.gov.br/ws/recepcaoevento/recepcaoevento4.asmx",
     }
 }
 
@@ -323,6 +325,211 @@ def transmitir_nfe(xml_str: str, ambiente: int = 2) -> dict:
 
     except Exception as e:
         return {"sucesso": False, "mensagem": f"Erro ao transmitir: {str(e)}"}
+
+
+def _assinar_evento(xml_evento: str) -> str:
+    """Assina o XML do evento NF-e com RSA-SHA1 (referência no elemento infEvento).
+
+    A assinatura deve estar dentro do elemento <evento>, não em <envEvento>.
+    Para isso, extraímos <evento> como documento independente, assinamos e
+    reinserimos dentro de <envEvento>.
+    """
+    if not certificado_carregado():
+        raise ValueError("Certificado digital não carregado")
+
+    cert_pem = obter_cert_pem()
+    key_pem = obter_key_pem()
+
+    clean_parser = etree.XMLParser(remove_blank_text=True)
+    env_root = etree.fromstring(xml_evento.strip().encode("utf-8"), clean_parser)
+
+    ns = {"nfe": NAMESPACE_NFE}
+    inf_evento = env_root.find(".//nfe:infEvento", ns)
+    if inf_evento is None:
+        raise ValueError("Elemento infEvento não encontrado no XML do evento")
+
+    ref_id = inf_evento.get("Id", "")
+
+    # Extrair <evento> como documento independente para que signxml o trate como raiz
+    evento_el = env_root.find(f"{{{NAMESPACE_NFE}}}evento")
+    evento_bytes = etree.tostring(evento_el, encoding="unicode").encode("utf-8")
+    evento_standalone = etree.fromstring(evento_bytes, etree.XMLParser(remove_blank_text=True))
+
+    signer = _NFeXMLSigner(
+        method=methods.enveloped,
+        signature_algorithm="rsa-sha1",
+        digest_algorithm="sha1",
+        c14n_algorithm=_C14N,
+    )
+    signed_evento = signer.sign(
+        evento_standalone,          # <evento> como raiz do documento de assinatura
+        key=key_pem,
+        cert=cert_pem,
+        reference_uri=f"#{ref_id}",
+        id_attribute="Id",
+        always_add_key_value=False,
+    )
+
+    # Reinserir o <evento> assinado dentro de <envEvento>
+    env_root.remove(env_root.find(f"{{{NAMESPACE_NFE}}}evento"))
+    env_root.append(signed_evento)
+
+    return etree.tostring(env_root, encoding="unicode", pretty_print=False)
+
+
+def cancelar_nfe(
+    chave_acesso: str,
+    numero_protocolo: str,
+    cnpj_cpf: str,
+    justificativa: str,
+    ambiente: int = 2,
+) -> dict:
+    """
+    Envia o evento de Cancelamento (tpEvento=110111) à SEFAZ-RS.
+    Retorna dict com sucesso, protocolo_cancelamento, xml_cancelamento, xml_enviado, xml_recebido.
+    """
+    if not certificado_carregado():
+        return {"sucesso": False, "mensagem": "Certificado digital não carregado."}
+
+    if len(justificativa) < 15:
+        return {"sucesso": False, "mensagem": "Justificativa deve ter ao menos 15 caracteres."}
+
+    now = datetime.now()
+    # Brazil UTC-3
+    dh_evento = now.strftime("%Y-%m-%dT%H:%M:%S") + "-03:00"
+    seq_ts = now.strftime("%Y%m%d%H%M%S") + "001"  # timestamp + sequência 001
+
+    doc_raw = re.sub(r"\D", "", cnpj_cpf)
+    if len(doc_raw) == 11:
+        tag_doc = f"<CPF>{doc_raw}</CPF>"
+    else:
+        tag_doc = f"<CNPJ>{doc_raw}</CNPJ>"
+
+    id_evento = f"ID110111{chave_acesso}01"
+
+    xml_inf_evento = (
+        f'<infEvento Id="{id_evento}">'
+        f"<cOrgao>43</cOrgao>"
+        f"<tpAmb>{ambiente}</tpAmb>"
+        f"{tag_doc}"
+        f"<chNFe>{chave_acesso}</chNFe>"
+        f"<dhEvento>{dh_evento}</dhEvento>"
+        f"<tpEvento>110111</tpEvento>"
+        f"<nSeqEvento>1</nSeqEvento>"
+        f"<verEvento>1.00</verEvento>"
+        f'<detEvento versao="1.00">'
+        f"<descEvento>Cancelamento</descEvento>"
+        f"<nProt>{numero_protocolo}</nProt>"
+        f"<xJust>{justificativa}</xJust>"
+        f"</detEvento>"
+        f"</infEvento>"
+    )
+
+    xml_evento = (
+        f'<envEvento versao="1.00" xmlns="{NAMESPACE_NFE}">'
+        f"<idLote>1</idLote>"
+        f'<evento versao="1.00">'
+        f"{xml_inf_evento}"
+        f"</evento>"
+        f"</envEvento>"
+    )
+
+    try:
+        xml_assinado = _assinar_evento(xml_evento)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"sucesso": False, "mensagem": f"Erro ao assinar evento: {str(e)}"}
+
+    amb_str = _get_ambiente_str(ambiente)
+    url = URLS_SEFAZ[amb_str]["NFeRecepcaoEvento"]
+
+    servico = "NFeRecepcaoEvento4"
+    envelope = f"""<?xml version="1.0" encoding="UTF-8"?>
+<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                 xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+  <soap12:Header>
+    <nfeCabecMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/{servico}">
+      <cUF>43</cUF>
+      <versaoDados>1.00</versaoDados>
+    </nfeCabecMsg>
+  </soap12:Header>
+  <soap12:Body>
+    <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/{servico}">{_compactar_xml(xml_assinado)}</nfeDadosMsg>
+  </soap12:Body>
+</soap12:Envelope>"""
+
+    headers = {
+        "Content-Type": f'application/soap+xml; charset=utf-8; action="http://www.portalfiscal.inf.br/nfe/wsdl/{servico}/nfeRecepcaoEvento"',
+        "SOAPAction": f'"http://www.portalfiscal.inf.br/nfe/wsdl/{servico}/nfeRecepcaoEvento"',
+    }
+
+    cert_pem = obter_cert_pem()
+    key_pem = obter_key_pem()
+
+    cert_path = None
+    key_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as cf:
+            cf.write(cert_pem)
+            cert_path = cf.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pem") as kf:
+            kf.write(key_pem)
+            key_path = kf.name
+
+        response = requests.post(
+            url,
+            data=envelope.encode("utf-8"),
+            headers=headers,
+            cert=(cert_path, key_path),
+            timeout=60,
+            verify=False,
+        )
+    finally:
+        for p in (cert_path, key_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    if response.status_code != 200:
+        #print(response.text)
+        return {
+            "sucesso": False,
+            "mensagem": f"Erro HTTP {response.status_code}",
+            "xml_enviado": envelope,
+            "xml_recebido": response.text,
+        }
+
+    root = ET.fromstring(response.text)
+    ns = {"nfe": NAMESPACE_NFE}
+
+    # cStat do lote (128 = "Lote de Evento Processado") — apenas para diagnóstico
+    cstat_lote = root.find(".//nfe:retEnvEvento/nfe:cStat", ns)
+
+    # Resultado do evento individual: retEvento > infEvento
+    inf_evento_ret = root.find(".//nfe:retEvento/nfe:infEvento", ns)
+    cstat = inf_evento_ret.find("nfe:cStat", ns) if inf_evento_ret is not None else None
+    xmotivo = inf_evento_ret.find("nfe:xMotivo", ns) if inf_evento_ret is not None else None
+    n_prot = inf_evento_ret.find("nfe:nProt", ns) if inf_evento_ret is not None else None
+    dh_reg = inf_evento_ret.find("nfe:dhRegEvento", ns) if inf_evento_ret is not None else None
+
+    # cStat 135 = Evento registrado e vinculado a NF-e
+    # cStat 136 = Evento registrado, mas NF-e não encontrada na base
+    cancelado = cstat is not None and cstat.text in ("135", "136")
+    #print(f"[cancelar_nfe] cStat lote={cstat_lote.text if cstat_lote is not None else 'None'} | cStat evento={cstat.text if cstat is not None else 'None'} | {xmotivo.text if xmotivo is not None else 'sem motivo'}")
+
+    return {
+        "sucesso": cancelado,
+        "codigo_status": cstat.text if cstat is not None else None,
+        "mensagem": xmotivo.text if xmotivo is not None else "Sem resposta",
+        "protocolo_cancelamento": n_prot.text if n_prot is not None else None,
+        "data_cancelamento": dh_reg.text if dh_reg is not None else None,
+        "xml_cancelamento": xml_assinado,
+        "xml_enviado": envelope,
+        "xml_recebido": response.text,
+    }
 
 
 def consultar_nfe(chave_acesso: str, ambiente: int = 2) -> dict:
